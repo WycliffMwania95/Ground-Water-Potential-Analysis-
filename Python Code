@@ -1,0 +1,307 @@
+import rasterio
+import numpy as np
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+import matplotlib.pyplot as plt
+from rasterio.plot import show
+from scipy.ndimage import gaussian_filter  # optional smoothing
+from scipy.ndimage import sobel, convolve
+import math
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)  # ignore div-by-zero etc.
+
+# 1. Define file paths
+files = {
+    'true_color': '/content/drive/MyDrive/Ground Water Potential Analysis/Kisii.tif',   # 3-band RGB
+    'ndvi'      : '/content/drive/MyDrive/Ground Water Potential Analysis/NDVI.tif',
+    'ndwi'      : '/content/drive/MyDrive/Ground Water Potential Analysis/NDWI.tif',
+    'swir'      : '/content/drive/MyDrive/Ground Water Potential Analysis/SWIR.tif',         # single band
+    'dem'       : '/content/drive/MyDrive/Ground Water Potential Analysis/Kisii_dem.tif'
+}
+
+# 2. Function to read single-band or multi-band raster
+def read_raster(path, band=1):
+    with rasterio.open(path) as src:
+        data = src.read(band) if src.count == 1 else src.read()
+        profile = src.profile
+        transform = src.transform
+        crs = src.crs
+    return data, profile, transform, crs
+
+
+# 3. Load all rasters
+data = {}
+profiles = {}
+transforms = {}
+crss = {}
+
+for key, fp in files.items():
+    if key == 'true_color':
+        data[key], profiles[key], transforms[key], crss[key] = read_raster(fp)  # shape (3, h, w)
+    else:
+        data[key], profiles[key], transforms[key], crss[key] = read_raster(fp)
+        data[key] = data[key].astype(np.float32)   # ensure float for calculations
+
+print("All rasters loaded. CRS check:", all(c == crss['dem'] for c in crss.values()))
+
+
+# Add LULC file (change path to yours)
+files['lulc'] = '/content/drive/MyDrive/Ground Water Potential Analysis/Kisii_LC.tif'
+
+# Load it (single-band assumed)
+data['lulc'], profiles['lulc'], transforms['lulc'], crss['lulc'] = read_raster(files['lulc'])
+data['lulc'] = data['lulc'].astype(np.float32)  # or int if classes are integers
+
+
+# 4. FORCE ALL RASTERS TO MATCH Sentinel-2 shape/extent/resolution
+# Use the true_color or any Sentinel-2 raster as reference
+ref_key = 'true_color'          # or 'ndvi' / 'ndwi' — whichever is your main Sentinel-2
+ref_shape = data[ref_key].shape[-2:]   # (height, width) = (792, 662)
+ref_transform = transforms[ref_key]
+ref_crs = crss[ref_key]
+ref_profile = profiles[ref_key]
+
+print(f"Reference: {ref_key} | shape: {ref_shape} | CRS: {ref_crs}")
+
+# Helper: reproject & resample one array to match reference
+def reproject_to_ref(arr, src_transform, src_crs, src_shape):
+    if arr.ndim == 3 and arr.shape[0] in [1, 3]:
+        # if multi-band but single meaningful band, take first
+        arr = arr[0] if arr.shape[0] == 3 else arr.squeeze(0)
+
+    if arr.shape == ref_shape and src_transform == ref_transform and src_crs == ref_crs:
+        return arr.astype(np.float32)  # already good
+
+    # Output array
+    out_arr = np.empty(ref_shape, dtype=np.float32)
+
+    reproject(
+        source=arr,
+        destination=out_arr,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        dst_transform=ref_transform,
+        dst_crs=ref_crs,
+        resampling=Resampling.bilinear,   # or cubic for smoother, nearest for categorical
+    )
+    return out_arr
+
+# Apply to all layers
+
+fixed_data = {}
+
+# Sentinel-2 derived layers (likely already matching ref)
+for key in ['true_color', 'ndvi', 'ndwi', 'swir', 'dem', 'lulc']:
+    if key in data:
+        fixed = reproject_to_ref(data[key], transforms[key], crss[key], data[key].shape[-2:])
+        # For indices: ensure single-band & scale if uint16
+        if fixed.ndim == 3:
+            fixed = fixed[0]  # take first band
+        if fixed.max() > 10:  # likely scaled by 10000
+            fixed = fixed / 10000.0
+            print(f"Scaled {key} to reflectance range")
+        fixed_data[key] = fixed
+
+# DEM-derived (slope & twi will be computed on reprojected DEM)
+dem_fixed = reproject_to_ref(data['dem'], transforms['dem'], crss['dem'], data['dem'].shape)
+
+# Now recompute slope and TWI on the matched DEM
+print("Recomputing slope & TWI on reprojected DEM...")
+
+
+pixel_size = abs(ref_transform[0])  # assume square pixels now
+dz_dx = sobel(dem_fixed, axis=1) / (8 * pixel_size)
+dz_dy = sobel(dem_fixed, axis=0) / (8 * pixel_size)
+slope_rad = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
+fixed_data['slope'] = np.tan(slope_rad) * 100  # percent
+
+tan_beta = np.tan(slope_rad)
+tan_beta[tan_beta < 0.005] = 0.005
+fixed_data['twi'] = np.log(pixel_size / tan_beta)
+
+# Update data dict
+data.update(fixed_data)
+
+print("All layers reprojected & matched. New shapes:")
+for k, v in data.items():
+    print(f"{k:10}: {v.shape}")
+
+
+# 4. Derive slope and TWI from DEM
+dem = data['dem']
+
+# Get pixel size from reference transform (assume square pixels; fallback to 10m for Sentinel-2)
+pixel_size = abs(transforms['true_color'][0]) if 'true_color' in transforms else 10.0
+print(f"Using pixel size: {pixel_size}m")
+
+# Slope in percent
+dz_dx = sobel(dem, axis=1) / (8 * pixel_size)
+dz_dy = sobel(dem, axis=0) / (8 * pixel_size)
+slope_rad = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
+data['slope'] = np.tan(slope_rad) * 100  # percent
+
+# TWI approximation
+tan_beta = np.tan(slope_rad)
+tan_beta[tan_beta < 0.005] = 0.005  # avoid div/0
+data['twi'] = np.log(pixel_size / tan_beta)
+
+# Confirm new shapes
+print("New slope shape:", data['slope'].shape)  # should be (792, 662)
+print("New TWI shape:", data['twi'].shape)     # should be (792, 662)
+
+
+
+# 5. Visualize all layers
+fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+axes = axes.ravel()
+
+# True color
+rgb = np.moveaxis(data['true_color'], 0, -1)
+rgb_norm = np.clip(rgb / np.percentile(rgb, 98, axis=(0,1)), 0, 1)
+axes[0].imshow(rgb_norm)
+axes[0].set_title('True Color')
+axes[0].axis('off')
+
+# squeeze to 2D if needed
+def safe_imshow(ax, arr, cmap='viridis', vmin=None, vmax=None, title=""):
+    arr2d = np.squeeze(arr)               # remove any singleton dims (1,h,w) → (h,w)
+    if arr2d.ndim != 2:
+        print(f"Warning: {title} is still not 2D after squeeze: {arr2d.shape}")
+        ax.text(0.5, 0.5, "Invalid shape", ha='center', va='center')
+        return
+    im = ax.imshow(arr2d, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax, shrink=0.6)
+    ax.axis('off')
+
+for key in ['ndvi', 'ndwi', 'swir', 'dem']:
+    if key in data:
+        arr = data[key]
+        valid = arr[~np.isnan(arr) & ~np.isinf(arr)]
+        if len(valid) == 0:
+            print(f"{key}: ALL values are NaN or Inf → cannot plot")
+        else:
+            print(f"{key:6} | shape: {arr.shape} | valid pixels: {len(valid)} / {arr.size} "
+                  f"({len(valid)/arr.size*100:.1f}%) | min: {valid.min():.4f} | max: {valid.max():.4f} "
+                  f"| mean: {valid.mean():.4f}")
+# Now plot the rest safely
+# NDVI: typical range after scaling → -1 to 1 (or -0.2 to 0.9 in practice)
+safe_imshow(axes[1], data['ndvi'], cmap='RdYlGn',
+            title='NDVI (green = healthy veg → possible shallow GW)')
+
+# NDWI: typical -1 to 1
+safe_imshow(axes[2], data['ndwi'], cmap='Blues',
+            title='NDWI (bright = wet/veg moisture → GW indicator)')
+
+# SWIR: raw band (after /10000 → 0 to ~0.5-0.6), lower = moister
+safe_imshow(axes[3], data['swir'], cmap='gray_r',
+            title='SWIR (dark = moist soil/veg)')
+
+safe_imshow(axes[4], data['slope'], cmap='terrain', vmin=0, vmax=15,
+            title='Slope (%) – flat = better GW potential')
+
+safe_imshow(axes[5], data['twi'],   cmap='YlGnBu', vmin=2, vmax=12,
+            title='TWI – higher = wetter zones')
+
+
+plt.tight_layout()
+plt.show()
+
+
+# 6. Simple Groundwater Potential Zoning (Weighted Overlay)
+#    Reclassify each layer → normalize 1–5 → weighted sum
+def normalize_to_1_5(arr, reverse=False):
+    arr_valid = arr[~np.isnan(arr) & ~np.isinf(arr)]
+    if len(arr_valid) == 0:
+        return np.full_like(arr, 3, dtype=np.float32)
+    minv, maxv = np.min(arr_valid), np.max(arr_valid)
+    if maxv == minv:
+        return np.full_like(arr, 3, dtype=np.float32)
+    norm = (arr - minv) / (maxv - minv)
+    if reverse:
+        norm = 1 - norm
+    return np.clip(norm * 4 + 1, 1, 5)
+
+# Reclassify / score each factor (higher score = better GW potential)
+scores = {}
+
+# NDVI: higher vegetation in dry season → better (shallow GW access)
+scores['ndvi'] = normalize_to_1_5(data['ndvi'])
+
+# NDWI: higher = more moisture → better
+scores['ndwi'] = normalize_to_1_5(data['ndwi'])
+
+# SWIR: lower = wetter → reverse
+scores['swir'] = normalize_to_1_5(data['swir'], reverse=True)
+
+# Slope: flatter → better (reverse)
+scores['slope'] = normalize_to_1_5(data['slope'], reverse=True)
+
+# TWI: higher → better (accumulates water)
+scores['twi'] = normalize_to_1_5(data['twi'])
+
+
+# Reclassify LULC to groundwater suitability score (1-5)
+# Customize this dict based on YOUR LULC class values!
+lulc_classes_to_score = {
+    1: 1,   # Built-up / Urban / Settlement → low
+    2: 2,   # Bare land
+    3: 3,   # Grassland / Shrub
+    4: 4,   # Agriculture / Cropland
+    5: 5,   # Forest / Vegetation / Water / Wetland
+
+}
+
+# Apply reclassification
+lulc_score = np.full_like(data['lulc'], 3, dtype=np.float32)  # default moderate
+for cls, score in lulc_classes_to_score.items():
+    lulc_score[data['lulc'] == cls] = score
+
+scores['lulc'] = normalize_to_1_5(lulc_score)  # optional normalize, or just use as-is if already 1-5
+
+
+# Optional: add DEM (lower elevation often better, but depends on context)
+# scores['dem'] = normalize_to_1_5(data['dem'], reverse=True)
+
+# Weights (sum to 1) — adjust these!
+weights = {
+    'ndvi'  : 0.20,
+    'ndwi'  : 0.15,
+    'swir'  : 0.10,
+    'slope' : 0.15,
+    'twi'   : 0.20,
+    'lulc' : 0.20,
+}
+
+# Weighted sum
+gwp = np.zeros_like(data['ndvi'], dtype=np.float32)
+for key, w in weights.items():
+    gwp += scores[key] * w
+
+# Optional smooth
+gwp_smooth = gaussian_filter(gwp, sigma=1)
+
+
+# 7. Plot final Groundwater Potential map
+fig, ax = plt.subplots(figsize=(10, 8))
+im = ax.imshow(gwp_smooth, cmap='viridis', vmin=1, vmax=5)
+ax.set_title('Groundwater Potential Zones in Kisii County\n(Higher = Better Potential)')
+fig.colorbar(im, ax=ax, label='Potential score (1–5)')
+ax.axis('off')
+plt.show()
+
+
+# 8. Optional: Save result as GeoTIFF
+out_profile = profiles['dem'].copy()
+out_profile.update(dtype=rasterio.float32, count=1)
+
+with rasterio.open('groundwater_potential.tif', 'w', **out_profile) as dst:
+    dst.write(gwp_smooth, 1)
+
+print("Saved: kisii_groundwater_potential.tif")
+
+
+
+
+
+
+
